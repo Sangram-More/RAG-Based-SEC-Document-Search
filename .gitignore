@@ -1,12 +1,21 @@
-.env 
+# Environment
+.env
 venv/
+
+# Data
 data/raw/
-data/processed
+data/processed/
 data/chroma_db/
+
+# Python
 __pycache__/
 *.pyc
-.pytest_cache/ 
+.pytest_cache/
+
+# Editors
 .vscode/
-.idea/ 
+.idea/
+
+# Personal
 personal_documentation.txt
 actions.md
