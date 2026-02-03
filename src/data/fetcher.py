@@ -1,5 +1,6 @@
 import requests
 import time
+import re
 from pathlib import Path
 from src.config.logging_config import logger
 
@@ -48,6 +49,52 @@ def get_cik_from_ticker(ticker: str) -> str:
 
 # ----------------------------------------------------------------------------
 
+def get_10k_document_url(cik: str, accession_number: str) -> str | None:
+    """
+    Get the URL for the human-readable 10-K document from the filing index.
+    """
+    accession_no_dashes = accession_number.replace("-", "")
+    index_url = f"https://www.sec.gov/Archives/edgar/data/{cik}/{accession_no_dashes}/index.json"
+    
+    try:
+        response = requests.get(index_url, headers=HEADERS)
+        response.raise_for_status()
+        data = response.json()
+        
+        items = data.get("directory", {}).get("item", [])
+        
+        # Look for 10-K document (exclude exhibits)
+        for item in items:
+            name = item.get("name", "").lower()
+            # Must end in .htm, contain "10k" or "10-k", but NOT be an exhibit
+            if name.endswith(".htm"):
+                if ("10k" in name or "10-k" in name):
+                    # Skip exhibit files
+                    if "exhibit" in name or "ex-" in name or "ex10" in name or "ex21" in name:
+                        continue
+                    return f"https://www.sec.gov/Archives/edgar/data/{cik}/{accession_no_dashes}/{item['name']}"
+        
+        # Fallback: find the largest .htm file that's not an exhibit
+        htm_files = []
+        for item in items:
+            name = item.get("name", "").lower()
+            if name.endswith(".htm"):
+                # Skip exhibits
+                if "exhibit" in name or "ex-" in name or "ex10" in name or "ex21" in name:
+                    continue
+                htm_files.append(item)
+        
+        if htm_files:
+            largest = max(htm_files, key=lambda x: int(x.get("size", 0)))
+            return f"https://www.sec.gov/Archives/edgar/data/{cik}/{accession_no_dashes}/{largest['name']}"
+        
+        return None
+    except Exception as e:
+        logger.warning(f"Could not get filing index: {e}")
+        return None
+
+# ----------------------------------------------------------------------------
+
 def get_filing_urls(cik: str, filing_type: str = "10-K", count: int = 2) -> list[dict]:
     """
     Get URLs from a company's SEC filings.
@@ -85,12 +132,19 @@ def get_filing_urls(cik: str, filing_type: str = "10-K", count: int = 2) -> list
         if recent_filings["form"][i] == filing_type:
             accession_number = recent_filings["accessionNumber"][i]
             filing_date = recent_filings["filingDate"][i]
-            primary_doc = recent_filings["primaryDocument"][i]
-    
-            # Building document url
-            # format: "https://www.sec.gov/Archives/edgar/data/{cik}/{accession_no_dashes}/{primary_doc}"
-            accession_no_dashes = accession_number.replace("-", "")
-            doc_url = f"https://www.sec.gov/Archives/edgar/data/{cik}/{accession_no_dashes}/{primary_doc}"
+            
+            # Use helper to get correct document URL
+            doc_url = get_10k_document_url(cik, accession_number)
+            
+            # Fallback to primaryDocument if helper fails
+            if not doc_url:
+                primary_doc = recent_filings["primaryDocument"][i]
+                accession_no_dashes = accession_number.replace("-", "")
+                doc_url = f"https://www.sec.gov/Archives/edgar/data/{cik}/{accession_no_dashes}/{primary_doc}"
+            
+            # Rate limiting for index requests
+            time.sleep(0.1)
+
             
             results.append({
                 "ticker": ticker,
@@ -115,15 +169,15 @@ def get_filing_urls(cik: str, filing_type: str = "10-K", count: int = 2) -> list
 
 def download_filing(filing: dict, output_dir: Path) -> Path | None:
     """
-    Download the actual filing document
-    
+    Download the actual filing document and associated images (charts).
+
     Args:
         filing: Dictionary with keys (ticker, cik, filing_date, accession_number, url)
         output_dir: Directory location to save the file
-    
+
     Returns:
         Path to saved file, or none if download fails
-    """ 
+    """
 
     ticker = filing["ticker"]
     filing_date = filing["filing_date"]
@@ -150,11 +204,35 @@ def download_filing(filing: dict, output_dir: Path) -> Path | None:
 
         logger.info(f"Saved file to {file_path}")
 
+        # Download associated images (charts)
+        base_url = url.rsplit("/", 1)[0]  # Get directory URL
+        image_refs = re.findall(r'src=["\']([^"\']+\.(?:jpg|jpeg|png|gif))["\']', response.text, re.IGNORECASE)
+
+        for img_ref in image_refs:
+            # Skip external URLs
+            if img_ref.startswith("http"):
+                continue
+
+            img_url = f"{base_url}/{img_ref}"
+            img_path = output_dir / img_ref
+
+            try:
+                img_response = requests.get(img_url, headers=HEADERS)
+                img_response.raise_for_status()
+
+                with open(img_path, "wb") as img_file:
+                    img_file.write(img_response.content)
+
+                logger.info(f"Downloaded image: {img_ref}")
+                time.sleep(0.1)  # Rate limiting
+            except requests.RequestException as e:
+                logger.warning(f"Failed to download image {img_ref}: {e}")
+
         # Rate Limiting
         time.sleep(0.1)
 
         return file_path
-    
+
     except requests.RequestException as e:
         # Error handling, logging and returning none
         logger.error(f"Failed to download {ticker} dated {filing_date}: {e}")
@@ -239,7 +317,8 @@ if __name__ == "__main__":
     # It won't run when the module is imported elsewhere
 
     # Companies to fetch (pick 5-10 from the list)
-    COMPANIES = ["AAPL", "MSFT", "GOOGL", "AMZN", "META", "TSLA", "NVDA", "JPM"]
+    # COMPANIES = ["AAPL", "MSFT", "GOOGL", "AMZN", "META", "TSLA", "NVDA", "JPM"]
+    COMPANIES = ["AAPL", "MSFT", "GOOGL"]
     
     all_paths = []
     
